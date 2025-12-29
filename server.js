@@ -1,5 +1,5 @@
 import express from 'express';
-import { createServer } from 'http';
+import { createServer, METHODS } from 'http';
 import { createClient } from 'redis';
 import { Server } from 'socket.io';
 import { betsService } from './bets-service.js';
@@ -17,7 +17,9 @@ const io = new Server(httpServer, {
   }
 });
 
-// app.use(cors());
+app.use(cors({
+  origin: "*",
+}));
 app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
