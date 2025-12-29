@@ -7,6 +7,7 @@ import env from './env/index.js';
 import EventValidator from './event-validator.js';
 import MarketManager from './market-manager.js';
 import { usersService } from './users-service.js';
+import cors from "cors"
 
 const app = express();
 const httpServer = createServer(app);
