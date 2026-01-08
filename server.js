@@ -8,6 +8,8 @@ import EventValidator from './event-validator.js';
 import MarketManager from './market-manager.js';
 import { usersService } from './users-service.js';
 import cors from "cors"
+import { success } from 'zod';
+import { decodeJwt } from "./utils/decoded-jwt.js"
 
 const app = express();
 const httpServer = createServer(app);
@@ -38,8 +40,9 @@ app.use((req, res, next) => {
 let activeGames = [];
 let connectedClients = 0;
 
-// Redis Publisher para o MarketManager
-let redisPublisher = null;
+// Redis clients globais (reutilizáveis)
+let redisClient = null; // Cliente principal para GET/SET
+let redisPublisher = null; // Publisher para MarketManager
 
 // Instancia o Event Validator (será inicializado após conectar o Redis)
 let eventValidator = null;
@@ -138,19 +141,53 @@ async function setupRedisSubscriber() {
           console.log(`[Redis] Received active games update: ${parsed.activeGames.length} games`);
           activeGames = parsed.activeGames.map(mapActiveGameToGame);
           broadcastGames();
+        } else if (parsed.type === 'odds' && parsed.odds) {
+          console.log('[Redis] Received odds update');
+          io.emit('odds-update', {
+            type: 'odds',
+            odds: parsed.odds,
+            timestamp: new Date().toISOString()
+          });
+        } else if (parsed.type === 'limits' && parsed.limits) {
+          console.log('[Redis] Received limits update');
+          io.emit('limits-update', {
+            type: 'limits',
+            limits: parsed.limits,
+            timestamp: new Date().toISOString()
+          });
         }
       } catch (error) {
         console.error('[Redis] Failed to parse active games message:', error);
       }
     };
 
-    // Registrar o handler usando o método correto do Redis v5
-
-    // Subscrever ao canal de active games
     await redisSubscriber.subscribe(ACTIVE_GAMES_CHANNEL, messageHandler);
     console.log(`[Redis] Subscribed to channel: ${ACTIVE_GAMES_CHANNEL}`);
   } catch (error) {
     console.error('[Redis] Failed to initialize subscriber:', error);
+  }
+}
+
+// Configurar Redis Client global (para GET/SET)
+async function setupRedisClient() {
+  redisClient = createClient({
+    socket: {
+      host: env.REDIS_HOST,
+      port: env.REDIS_PORT,
+    },
+    username: env.REDIS_USERNAME,
+    password: env.REDIS_PASSWORD,
+  });
+
+  redisClient.on('error', (error) => {
+    console.error('[Redis Client] Erro na conexão:', error);
+  });
+
+  try {
+    await redisClient.connect();
+    console.log('[Redis Client] ✅ Conectado (conexão persistente)');
+  } catch (error) {
+    console.error('[Redis Client] Erro ao conectar:', error);
   }
 }
 
@@ -174,7 +211,7 @@ async function setupRedisPublisher() {
     console.log('[Redis] Publisher connected');
 
     // Inicializa o EventValidator
-    eventValidator = new EventValidator(betsService, usersService, io);
+    eventValidator = new EventValidator(io);
     await eventValidator.initialize();
     console.log('[EventValidator] Inicializado');
 
@@ -194,6 +231,7 @@ async function setupRedisPublisher() {
 
 // Inicializar: buscar jogos do Redis e configurar subscriber
 async function initializeRedis() {
+  await setupRedisClient(); // Inicializa cliente global primeiro
   await setupRedisPublisher();
   await fetchActiveGamesFromRedis();
   await setupRedisSubscriber();
@@ -204,33 +242,35 @@ async function initializeRedis() {
 initializeRedis();
 
 function broadcastGames() {
-  io.emit('games-update', activeGames);
+  const payload = {
+    type: 'active-games',
+    activeGames: activeGames,
+    timestamp: new Date().toISOString()
+  };
+  console.log(`[WebSocket] Broadcasting ${activeGames.length} active games to ${connectedClients} clients`);
+  io.emit('active-games-update', payload);
 }
 
 // Função para publicar número de jogadores online no Redis
 async function publishOnlinePlayers() {
-  const redisClient = createClient({
-    socket: {
-      host: env.REDIS_HOST,
-      port: env.REDIS_PORT,
-    },
-    username: env.REDIS_USERNAME,
-    password: env.REDIS_PASSWORD,
-  });
+  if (!redisClient || !redisClient.isOpen) {
+    console.error('[Redis] Cliente Redis não está conectado');
+    return;
+  }
 
   try {
-    await redisClient.connect();
-
     const message = JSON.stringify({
       type: 'online-players',
       count: connectedClients,
-      emittedAt: new Date().toISOString(),
+      timestamp: new Date().toISOString(),
     });
 
-    await redisClient.set(`${ONLINE_PLAYERS_CHANNEL}:${ONLINE_PLAYERS_KEY}`, message);
-    await redisClient.publish(ONLINE_PLAYERS_CHANNEL, message);
+    console.log(`[Redis] Publicando online players: ${connectedClients}`);
 
-    await redisClient.quit();
+    await Promise.all([
+      redisClient.set(`${ONLINE_PLAYERS_CHANNEL}:${ONLINE_PLAYERS_KEY}`, message),
+      redisClient.publish(ONLINE_PLAYERS_CHANNEL, message)
+    ]);
   } catch (error) {
     console.error('[Redis] Failed to publish online players:', error);
   }
@@ -275,136 +315,14 @@ app.get('/api/games/active', async (req, res) => {
   }
 });
 
-// Rota SSE para stream de jogos ativos
-app.get('/api/games/active/stream', async (req, res) => {
-  // Configurar headers para SSE
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
-  // Função para enviar dados via SSE
-  const sendSSE = (data) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
-  // Buscar jogos iniciais do Redis.
-  const fetchAndSendInitialGames = async () => {
-    try {
-      const redisClient = createClient({
-        socket: {
-          host: env.REDIS_HOST,
-          port: env.REDIS_PORT,
-        },
-        username: env.REDIS_USERNAME,
-        password: env.REDIS_PASSWORD,
-      });
-
-      await redisClient.connect();
-      const value = await redisClient.get(`${ACTIVE_GAMES_CHANNEL}:${ACTIVE_GAMES_KEY}`);
-
-      let gamesArray = [];
-      if (value) {
-        try {
-          const parsed = JSON.parse(value);
-          if (parsed.type === 'active-games' && Array.isArray(parsed.activeGames)) {
-            gamesArray = parsed.activeGames;
-          } else if (Array.isArray(parsed.activeGames)) {
-            gamesArray = parsed.activeGames;
-          }
-        } catch (parseError) {
-          console.error('[SSE] Failed to parse active games:', parseError);
-        }
-      }
-
-      await redisClient.quit();
-
-      // Enviar jogos iniciais
-
-      sendSSE({
-        type: 'active-games',
-        activeGames: gamesArray
-      });
-    } catch (error) {
-      console.error('[SSE] Failed to fetch initial games:', error);
-      sendSSE({
-        type: 'active-games',
-        activeGames: []
-      });
-    }
-  };
-
-  // Enviar heartbeat periódico
-  const heartbeatInterval = setInterval(() => {
-    res.write(': heartbeat\n\n');
-  }, 25000);
-
-  // Configurar subscriber do Redis para esta conexão
-  const redisSubscriber = createClient({
-    socket: {
-      host: env.REDIS_HOST,
-      port: env.REDIS_PORT,
-    },
-    username: env.REDIS_USERNAME,
-    password: env.REDIS_PASSWORD,
-  });
-
-  redisSubscriber.on('error', (error) => {
-    console.error('[SSE] Redis subscriber error:', error);
-  });
-
-  try {
-    await redisSubscriber.connect();
-
-    // Handler para mensagens do Redis (padrão Redis v5)
-    const messageHandler = (message) => {
-      try {
-        const parsed = JSON.parse(message);
-
-        if (parsed.type === 'active-games' && Array.isArray(parsed.activeGames)) {
-          sendSSE({
-            type: 'active-games',
-            activeGames: parsed.activeGames
-          });
-        }
-      } catch (error) {
-        console.error('[SSE] Failed to parse Redis message:', error);
-      }
-    };
-
-    // Subscrever ao canal
-    await redisSubscriber.subscribe(ACTIVE_GAMES_CHANNEL, messageHandler);
-
-    // Buscar e enviar jogos iniciais
-    await fetchAndSendInitialGames();
-
-    // Limpar quando a conexão for fechada
-    req.on('close', async () => {
-      clearInterval(heartbeatInterval);
-      try {
-        await redisSubscriber.unsubscribe(ACTIVE_GAMES_CHANNEL);
-        await redisSubscriber.quit();
-      } catch (error) {
-        console.error('[SSE] Error cleaning up:', error);
-      }
-      res.end();
-    });
-  } catch (error) {
-    console.error('[SSE] Failed to setup Redis subscriber:', error);
-    clearInterval(heartbeatInterval);
-    res.end();
-  }
-});
-
-// Endpoints removidos - os jogos agora são gerenciados pelo admin via Next.js
 // Os jogos são buscados diretamente do Redis
-
 app.get('/api/games', (req, res) => {
-  res.json(activeGames);
+  return res.json(activeGames);
 });
 
 
 // Inicia o ciclo automático
+// TODO: VALIDACAO DO ADMIN BACKEND
 app.post('/api/market/start', async (req, res) => {
   if (activeGames.length === 0) {
     return res.status(400).json({
@@ -549,300 +467,72 @@ app.get('/api/odds', async (req, res) => {
   }
 });
 
-// Rota SSE para stream de odds
-app.get('/api/odds/stream', async (req, res) => {
-  // Configurar headers para SSE
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
-  // Função para enviar dados via SSE
-  const sendSSE = (data) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
-  // Buscar odds iniciais do Redis
-  const fetchAndSendInitialOdds = async () => {
-    try {
-      const redisClient = createClient({
-        socket: {
-          host: env.REDIS_HOST,
-          port: env.REDIS_PORT,
-        },
-        username: env.REDIS_USERNAME,
-        password: env.REDIS_PASSWORD,
-      });
-
-      await redisClient.connect();
-      const value = await redisClient.get('prj-nextplay:odds:latest');
-
-      let odds = null;
-      if (value) {
-        try {
-          const parsed = JSON.parse(value);
-          if (parsed.type === 'odds' && parsed.odds) {
-            odds = parsed.odds;
-          }
-        } catch (parseError) {
-          console.error('[SSE Odds] Failed to parse odds:', parseError);
-        }
-      }
-
-      // Odds padrão se não houver configuradas
-      if (!odds) {
-        odds = {
-          side: 1.50,
-          corner: 1.50,
-          foul: 1.50,
-          goal: 1.50,
-          atLeastOne: 1.50
-        };
-      }
-
-      await redisClient.quit();
-
-      // Enviar odds iniciais
-      sendSSE({
-        type: 'odds',
-        odds: odds
-      });
-    } catch (error) {
-      console.error('[SSE Odds] Failed to fetch initial odds:', error);
-      sendSSE({
-        type: 'odds',
-        odds: {
-          side: 1.50,
-          corner: 1.50,
-          foul: 1.50,
-          goal: 1.50,
-          atLeastOne: 1.50
-        }
-      });
-    }
-  };
-
-  // Enviar heartbeat periódico
-  const heartbeatInterval = setInterval(() => {
-    res.write(': heartbeat\n\n');
-  }, 25000);
-
-  // Configurar subscriber do Redis para esta conexão
-  const redisSubscriber = createClient({
-    socket: {
-      host: env.REDIS_HOST,
-      port: env.REDIS_PORT,
-    },
-    username: env.REDIS_USERNAME,
-    password: env.REDIS_PASSWORD,
-  });
-
-  redisSubscriber.on('error', (error) => {
-    console.error('[SSE Odds] Redis subscriber error:', error);
-  });
-
-  try {
-    await redisSubscriber.connect();
-
-    // Handler para mensagens do Redis
-    const messageHandler = (message) => {
-      try {
-        const parsed = JSON.parse(message);
-
-        if (parsed.type === 'odds' && parsed.odds) {
-          console.log('[SSE Odds] Odds update received:', parsed.odds);
-          sendSSE({
-            type: 'odds',
-            odds: parsed.odds
-          });
-        }
-      } catch (error) {
-        console.error('[SSE Odds] Failed to parse Redis message:', error);
-      }
-    };
-
-    // Subscrever ao canal de odds (mesmo canal que active games)
-    await redisSubscriber.subscribe(ACTIVE_GAMES_CHANNEL, messageHandler);
-    console.log('[SSE Odds] Client connected to odds stream');
-
-    // Buscar e enviar odds iniciais
-    await fetchAndSendInitialOdds();
-
-    // Limpar quando a conexão for fechada
-    req.on('close', async () => {
-      console.log('[SSE Odds] Client disconnected');
-      clearInterval(heartbeatInterval);
-      try {
-        await redisSubscriber.unsubscribe(ACTIVE_GAMES_CHANNEL);
-        await redisSubscriber.quit();
-      } catch (error) {
-        console.error('[SSE Odds] Error cleaning up:', error);
-      }
-      res.end();
-    });
-  } catch (error) {
-    console.error('[SSE Odds] Failed to setup Redis subscriber:', error);
-    clearInterval(heartbeatInterval);
-    res.end();
-  }
-});
-
-// Rota SSE para stream de limits
-app.get('/api/limits/stream', async (req, res) => {
-  // Configurar headers para SSE
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-
-  // Função para enviar dados via SSE
-  const sendSSE = (data) => {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
-
-  // Buscar limits iniciais do Redis
-  const fetchAndSendInitialLimits = async () => {
-    try {
-      const redisClient = createClient({
-        socket: {
-          host: env.REDIS_HOST,
-          port: env.REDIS_PORT,
-        },
-        username: env.REDIS_USERNAME,
-        password: env.REDIS_PASSWORD,
-      });
-
-      await redisClient.connect();
-      const value = await redisClient.get('prj-nextplay:limits:latest');
-
-      let limits = null;
-      if (value) {
-        try {
-          const parsed = JSON.parse(value);
-          if (parsed.type === 'limits' && parsed.limits) {
-            limits = parsed.limits;
-          }
-        } catch (parseError) {
-          console.error('[SSE Limits] Failed to parse limits:', parseError);
-        }
-      }
-
-      // Limits padrão se não houver configurados (valores em centavos)
-      if (!limits) {
-        limits = {
-          minimumBet: 200,      // 200 centavos = R$ 2,00
-          maximumBet: 10000,    // 10000 centavos = R$ 100,00
-          refund: 95,
-          bettingTime: 10,
-          playTime: 60,
-          waitingTime: 10
-        };
-      }
-
-      await redisClient.quit();
-
-      // Enviar limits iniciais
-      sendSSE({
-        type: 'limits',
-        limits: limits
-      });
-    } catch (error) {
-      console.error('[SSE Limits] Failed to fetch initial limits:', error);
-      sendSSE({
-        type: 'limits',
-        limits: {
-          minimumBet: 200,      // 200 centavos = R$ 2,00
-          maximumBet: 10000,    // 10000 centavos = R$ 100,00
-          refund: 95,
-          bettingTime: 10,
-          playTime: 60,
-          waitingTime: 10
-        }
-      });
-    }
-  };
-
-  // Enviar heartbeat periódico
-  const heartbeatInterval = setInterval(() => {
-    res.write(': heartbeat\n\n');
-  }, 25000);
-
-  // Configurar subscriber do Redis para esta conexão
-  const redisSubscriber = createClient({
-    socket: {
-      host: env.REDIS_HOST,
-      port: env.REDIS_PORT,
-    },
-    username: env.REDIS_USERNAME,
-    password: env.REDIS_PASSWORD,
-  });
-
-  redisSubscriber.on('error', (error) => {
-    console.error('[SSE Limits] Redis subscriber error:', error);
-  });
-
-  try {
-    await redisSubscriber.connect();
-
-    // Handler para mensagens do Redis
-    const messageHandler = (message) => {
-      try {
-        const parsed = JSON.parse(message);
-
-        if (parsed.type === 'limits' && parsed.limits) {
-          console.log('[SSE Limits] Limits update received:', parsed.limits);
-          sendSSE({
-            type: 'limits',
-            limits: parsed.limits
-          });
-        }
-      } catch (error) {
-        console.error('[SSE Limits] Failed to parse Redis message:', error);
-      }
-    };
-
-    // Subscrever ao canal de limits (mesmo canal que active games)
-    await redisSubscriber.subscribe(ACTIVE_GAMES_CHANNEL, messageHandler);
-    console.log('[SSE Limits] Client connected to limits stream');
-
-    // Buscar e enviar limits iniciais
-    await fetchAndSendInitialLimits();
-
-    // Limpar quando a conexão for fechada
-    req.on('close', async () => {
-      console.log('[SSE Limits] Client disconnected');
-      clearInterval(heartbeatInterval);
-      try {
-        await redisSubscriber.unsubscribe(ACTIVE_GAMES_CHANNEL);
-        await redisSubscriber.quit();
-      } catch (error) {
-        console.error('[SSE Limits] Error cleaning up:', error);
-      }
-      res.end();
-    });
-  } catch (error) {
-    console.error('[SSE Limits] Failed to setup Redis subscriber:', error);
-    clearInterval(heartbeatInterval);
-    res.end();
-  }
-});
-
 // Rota para realizar apostas
 app.post('/api/bets/place', async (req, res) => {
-  const { userId, gameId, eventType, amount, selectedSide } = req.body;
-
+  const {
+    gameId, 
+    eventType, 
+    amount, 
+    selectedSide, 
+    biabCustomer, 
+    accountId, 
+    sportId,
+    sportName,
+    competitionId,
+    competitionName,
+    eventId, 
+    eventName,
+    eventDate,
+  } = req.body;
+    
   // Validação de campos obrigatórios
-  if (!userId || !gameId || !eventType || !amount || !selectedSide) {
+  if (
+    !gameId || 
+    !eventType || 
+    !amount || 
+    !accountId ||
+    !biabCustomer ||
+    !selectedSide || 
+    amount <= 0 || 
+    !sportId || 
+    !sportName || 
+    !competitionId || 
+    !competitionName || 
+    !eventId || 
+    !eventName || 
+    !eventDate
+  ) {
     return res.status(400).json({
       error: 'Campos obrigatórios faltando',
-      required: ['userId', 'gameId', 'eventType', 'amount', 'selectedSide']
+      required: ['gameId', 'eventType', 'amount', 'selectedSide']
+    });
+  }
+
+  let userId = null
+  let loginId = null
+
+  try {
+    const decoded = decodeJwt(biabCustomer);
+    if (decoded) {
+      userId = decoded.userId
+      loginId = decoded.loginId
+    }
+  } catch(error) {
+    console.log("ERROR: decoded token:", error)
+    return res.status(400).json({
+      error: 'Error ao fazer decoded do token'
+    });
+  }
+
+  if(userId === null) {
+    return res.status(400).json({
+      error: 'Error ao fazer decoded do token'
     });
   }
 
   // Validação: mercado deve estar aberto
   if (!marketManager.canPlaceBet()) {
     return res.status(403).json({
-      error: 'Mercado fechado. Não é possível realizar apostas no momento.',
       marketStatus: marketManager.getStatus()
     });
   }
@@ -862,47 +552,9 @@ app.post('/api/bets/place', async (req, res) => {
       error: 'Jogo não encontrado ou não está ativo'
     });
   }
-
-  // TODO: REMOVER ISSO DAQUI DEVERA FICAR NA API DO GUI
-  // Validação: valor mínimo
-  if (amount <= 0) {
-    return res.status(400).json({
-      error: 'Valor da aposta deve ser maior que zero'
-    });
-  }
-
-  // Busca usuário
-  const userResult = await usersService.getUser(userId);
-  if (!userResult.success) {
-    return res.status(500).json({
-      error: 'Erro ao buscar dados do usuário'
-    });
-  }
-
-
-  // TODO REMOVER ISSO, FICARA NA API DO GUI
-  // Validação: saldo suficiente
-  if (userResult.user.balance < amount) {
-    return res.status(400).json({
-      error: 'Saldo insuficiente',
-      currentBalance: userResult.user.balance,
-      required: amount
-    });
-  }
-
-  // Buscar odds do Redis
-  let odd = 1.50; // Odd padrão
+  
+  let odd = null;
   try {
-    const redisClient = createClient({
-      socket: {
-        host: env.REDIS_HOST,
-        port: env.REDIS_PORT,
-      },
-      username: env.REDIS_USERNAME,
-      password: env.REDIS_PASSWORD,
-    });
-
-    await redisClient.connect();
     const oddsValue = await redisClient.get('prj-nextplay:odds:latest');
 
     if (oddsValue) {
@@ -911,22 +563,38 @@ app.post('/api/bets/place', async (req, res) => {
         odd = parsed.odds[eventType];
       }
     }
-
-    await redisClient.quit();
   } catch (error) {
     console.error('[Bet] Erro ao buscar odds:', error);
-    // Continua com a odd padrão
+    return res.status(500).json({
+      error: 'Erro ao buscar odds'
+    });
+  }
+
+  if(odd === null) {
+    return res.status(404).json({
+      error: 'Jogo não encontrado ou não está ativo'
+    });
   }
 
   // Realiza a aposta usando o BetsService
   const result = await betsService.placeBet({
     userId,
     gameId,
+    accountId,
     gameName: game.name || game.id,
     eventType,
     amount,
     selectedSide,
-    odd
+    odd,
+    loginId,
+    biabCustomer,
+    sportId,
+    sportName,
+    competitionId,
+    competitionName,
+    eventId,
+    eventName,
+    eventDate,
   });
 
   if (!result.success) {
@@ -935,80 +603,23 @@ app.post('/api/bets/place', async (req, res) => {
     });
   }
 
-  // Deduz o valor do saldo do usuário
-  const deductResult = await usersService.deductBalance(userId, amount);
-  if (!deductResult.success) {
-    // Se falhar ao deduzir, tentar reverter a aposta (implementar rollback se necessário)
-    console.error('[Bet] Erro ao deduzir saldo:', deductResult.error);
-    return res.status(500).json({
-      error: 'Erro ao processar pagamento da aposta'
-    });
-  }
-
-  console.log('[Bet] Nova aposta criada:', {
-    betId: result.betId,
-    marketId: result.marketId,
-    userId,
-    gameId,
-    eventType,
-    amount,
-    selectedSide,
-    odd,
-    potentialWin: amount * odd,
-    newBalance: deductResult.newBalance
-  });
-
-  // Criar registro no banco para teste do finalizar-apostas
-  try {
-    const { getBetsDb } = await import('./mongodb.js');
-    const { ObjectId } = await import('mongodb');
-    const db = await getBetsDb();
-    const betsCollection = db.collection('bets');
-
-    const betDoc = {
-      _id: new ObjectId(),
-      betId: result.betId,
-      userId,
-      gameId,
-      gameName: game.name || game.id,
-      marketId: result.marketId,
-      eventType,
-      selectedSide,
-      amount,
-      odd,
-      potentialWin: Math.floor(amount * odd),
-      status: 'pending',
-      payout: null,
-      refund: null,
-      resultReason: null,
-      eventsCount: 0,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      processedAt: null
-    };
-
-    await betsCollection.insertOne(betDoc);
-  } catch (error) {
-    console.error('[Bet] Erro ao inserir no banco:', error);
-  }
-
   res.json({
     success: true,
     message: 'Aposta realizada com sucesso',
     bet: result.bet,
     betId: result.betId,
     marketId: result.marketId,
-    newBalance: deductResult.newBalance
+    newBalance: result.newBalance
   });
 });
 
 // Rota para buscar apostas de um usuário
-app.get('/api/bets/user/:userId', async (req, res) => {
-  const { userId } = req.params;
+app.get('/api/bets/user/:accountId', async (req, res) => {
+  const { accountId } = req.params;
   const limit = parseInt(req.query.limit) || 50;
 
   try {
-    const result = await betsService.getBetsByUser(userId, limit);
+    const result = await betsService.getBetsByUser(accountId, limit);
 
     if (!result.success) {
       return res.status(500).json({
@@ -1141,64 +752,48 @@ app.get('/api/bets/:betId/logs', async (req, res) => {
   }
 });
 
-// Rota para buscar estatísticas gerais
-app.get('/api/bets/stats', async (req, res) => {
-  try {
-    const result = await betsService.getStats();
-
-    if (!result.success) {
-      return res.status(500).json({
-        error: result.error || 'Erro ao buscar estatísticas'
-      });
-    }
-
-    res.json({
-      success: true,
-      stats: result.stats
-    });
-  } catch (error) {
-    console.error('[API] Erro ao buscar estatísticas:', error);
-    res.status(500).json({
-      error: 'Erro ao buscar estatísticas'
-    });
-  }
-});
-
-// Rota para buscar estatísticas do dia
-app.get('/api/bets/stats/daily', async (req, res) => {
-  try {
-    const result = await betsService.getDailyStats();
-
-    if (!result.success) {
-      return res.status(500).json({
-        error: result.error || 'Erro ao buscar estatísticas do dia'
-      });
-    }
-
-    res.json({
-      success: true,
-      stats: result.stats
-    });
-  } catch (error) {
-    console.error('[API] Erro ao buscar estatísticas do dia:', error);
-    res.status(500).json({
-      error: 'Erro ao buscar estatísticas do dia'
-    });
-  }
-});
-
 // Rota para buscar eventos de um mercado
 app.get('/api/markets/:marketId/events', async (req, res) => {
   const { marketId } = req.params;
 
   try {
-    if (!eventValidator) {
-      return res.status(503).json({
-        error: 'EventValidator não inicializado'
-      });
+    let events = [];
+
+    // Primeiro tenta buscar da memória (EventValidator)
+    if (eventValidator) {
+      events = eventValidator.getMarketEvents(marketId);
     }
 
-    const events = eventValidator.getMarketEvents(marketId);
+    // Se não encontrou na memória, busca do banco de dados
+    if (events.length === 0) {
+      const marketResult = await betsService.getMarket(marketId);
+
+      if (marketResult.success && marketResult.market && marketResult.market.results) {
+        const results = marketResult.market.results;
+
+        // Reconstruir array de eventos a partir dos results salvos
+        if (results.eventsBySide) {
+          if (results.eventsBySide.A && results.eventsBySide.A.events) {
+            events.push(...results.eventsBySide.A.events.map(e => ({
+              ...e,
+              gameId: results.eventsBySide.A.gameId,
+              side: 'A'
+            })));
+          }
+
+          if (results.eventsBySide.B && results.eventsBySide.B.events) {
+            events.push(...results.eventsBySide.B.events.map(e => ({
+              ...e,
+              gameId: results.eventsBySide.B.gameId,
+              side: 'B'
+            })));
+          }
+        }
+
+        // Ordena por timestamp
+        events.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+      }
+    }
 
     res.json({
       success: true,
@@ -1242,108 +837,242 @@ app.get('/api/users/:userId', async (req, res) => {
 });
 
 // Rota para adicionar saldo manualmente (admin)
-app.post('/api/users/:userId/add-balance', async (req, res) => {
-  const { userId } = req.params;
-  const { amount, reason } = req.body;
+// app.post('/api/users/:userId/add-balance', async (req, res) => {
+//   const { userId } = req.params;
+//   const { amount, reason } = req.body;
 
-  if (!amount || amount <= 0) {
-    return res.status(400).json({
-      error: 'Valor deve ser maior que zero'
-    });
-  }
+//   if (!amount || amount <= 0) {
+//     return res.status(400).json({
+//       error: 'Valor deve ser maior que zero'
+//     });
+//   }
 
-  try {
-    const result = await usersService.addBalanceManual(userId, amount, reason);
+//   try {
+//     const result = await usersService.addBalanceManual(userId, amount, reason);
 
-    if (!result.success) {
-      return res.status(500).json({
-        error: result.error || 'Erro ao adicionar saldo'
-      });
-    }
+//     if (!result.success) {
+//       return res.status(500).json({
+//         error: result.error || 'Erro ao adicionar saldo'
+//       });
+//     }
 
-    res.json({
-      success: true,
-      message: result.message,
-      user: result.user,
-      newBalance: result.newBalance
-    });
-  } catch (error) {
-    console.error('[API] Erro ao adicionar saldo:', error);
-    res.status(500).json({
-      error: 'Erro ao adicionar saldo'
-    });
-  }
-});
+//     res.json({
+//       success: true,
+//       message: result.message,
+//       user: result.user,
+//       newBalance: result.newBalance
+//     });
+//   } catch (error) {
+//     console.error('[API] Erro ao adicionar saldo:', error);
+//     res.status(500).json({
+//       error: 'Erro ao adicionar saldo'
+//     });
+//   }
+// });
 
 // Rota para resetar saldo de um usuário
-app.post('/api/users/:userId/reset-balance', async (req, res) => {
-  const { userId } = req.params;
-  const { newBalance } = req.body;
+// app.post('/api/users/:userId/reset-balance', async (req, res) => {
+//   const { userId } = req.params;
+//   const { newBalance } = req.body;
 
-  const balanceToSet = newBalance !== undefined ? newBalance : 1000;
+//   const balanceToSet = newBalance !== undefined ? newBalance : 1000;
 
-  try {
-    const result = await usersService.resetBalance(userId, balanceToSet);
+//   try {
+//     const result = await usersService.resetBalance(userId, balanceToSet);
 
-    if (!result.success) {
-      return res.status(404).json({
-        error: result.error || 'Usuário não encontrado'
-      });
-    }
+//     if (!result.success) {
+//       return res.status(404).json({
+//         error: result.error || 'Usuário não encontrado'
+//       });
+//     }
 
-    res.json({
-      success: true,
-      message: `Saldo resetado para R$ ${balanceToSet}`,
-      user: result.user,
-      newBalance: result.newBalance
-    });
-  } catch (error) {
-    console.error('[API] Erro ao resetar saldo:', error);
-    res.status(500).json({
-      error: 'Erro ao resetar saldo'
-    });
-  }
-});
+//     res.json({
+//       success: true,
+//       message: `Saldo resetado para R$ ${balanceToSet}`,
+//       user: result.user,
+//       newBalance: result.newBalance
+//     });
+//   } catch (error) {
+//     console.error('[API] Erro ao resetar saldo:', error);
+//     res.status(500).json({
+//       error: 'Erro ao resetar saldo'
+//     });
+//   }
+// });
 
 // Rota para listar todos os usuários
-app.get('/api/users', async (req, res) => {
-  const limit = parseInt(req.query.limit) || 100;
+// app.get('/api/users', async (req, res) => {
+//   const limit = parseInt(req.query.limit) || 100;
 
-  try {
-    const result = await usersService.getAllUsers(limit);
+//   try {
+//     const result = await usersService.getAllUsers(limit);
 
-    if (!result.success) {
-      return res.status(500).json({
-        error: result.error || 'Erro ao listar usuários'
-      });
-    }
+//     if (!result.success) {
+//       return res.status(500).json({
+//         error: result.error || 'Erro ao listar usuários'
+//       });
+//     }
 
-    res.json({
-      success: true,
-      users: result.users,
-      count: result.count
-    });
-  } catch (error) {
-    console.error('[API] Erro ao listar usuários:', error);
-    res.status(500).json({
-      error: 'Erro ao listar usuários'
-    });
-  }
-});
+//     res.json({
+//       success: true,
+//       users: result.users,
+//       count: result.count
+//     });
+//   } catch (error) {
+//     console.error('[API] Erro ao listar usuários:', error);
+//     res.status(500).json({
+//       error: 'Erro ao listar usuários'
+//     });
+//   }
+// });
 
-io.on('connection', (socket) => {
-  console.log('Cliente conectado:', socket.id);
+io.on('connection', async (socket) => {
+  console.log(`[WebSocket] Cliente conectado: ${socket.id} (Total: ${connectedClients + 1})`);
   connectedClients++;
   publishOnlinePlayers();
 
-  // Envia jogos ativos
-  socket.emit('games-update', activeGames);
+  // Envia jogos ativos iniciais para o novo cliente
+  socket.emit('active-games-update', {
+    type: 'active-games',
+    activeGames: activeGames,
+    timestamp: new Date().toISOString()
+  });
 
   // Envia status do mercado atual
   socket.emit('market-status', marketManager.getStatus());
 
+  // Envia odds iniciais
+  try {
+    const oddsValue = await redisClient.get('prj-nextplay:odds:latest');
+    let odds = null;
+    if (oddsValue) {
+      const parsed = JSON.parse(oddsValue);
+      if (parsed.type === 'odds' && parsed.odds) {
+        odds = parsed.odds;
+      }
+    }
+    if (!odds) {
+      odds = {
+        side: 1.50,
+        corner: 1.50,
+        foul: 1.50,
+        goal: 1.50,
+        atLeastOne: 1.50
+      };
+    }
+    socket.emit('odds-update', {
+      type: 'odds',
+      odds: odds,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[WebSocket] Erro ao enviar odds iniciais:', error);
+  }
+
+  // Envia limits iniciais
+  try {
+    const limitsValue = await redisClient.get('prj-nextplay:limits:latest');
+    let limits = null;
+    if (limitsValue) {
+      const parsed = JSON.parse(limitsValue);
+      if (parsed.type === 'limits' && parsed.limits) {
+        limits = parsed.limits;
+      }
+    }
+    if (!limits) {
+      limits = {
+        minimumBet: 200,
+        maximumBet: 10000,
+        refund: 95,
+        bettingTime: 10,
+        playTime: 60,
+        waitingTime: 10
+      };
+    }
+    socket.emit('limits-update', {
+      type: 'limits',
+      limits: limits,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[WebSocket] Erro ao enviar limits iniciais:', error);
+  }
+
+  // Listener para solicitar jogos ativos manualmente
+  socket.on('request-active-games', () => {
+    console.log(`[WebSocket] Cliente ${socket.id} solicitou jogos ativos`);
+    socket.emit('active-games-update', {
+      type: 'active-games',
+      activeGames: activeGames,
+      timestamp: new Date().toISOString()
+    });
+  });
+
+  // Listener para solicitar odds manualmente
+  socket.on('request-odds', async () => {
+    console.log(`[WebSocket] Cliente ${socket.id} solicitou odds`);
+    try {
+      const oddsValue = await redisClient.get('prj-nextplay:odds:latest');
+      let odds = null;
+      if (oddsValue) {
+        const parsed = JSON.parse(oddsValue);
+        if (parsed.type === 'odds' && parsed.odds) {
+          odds = parsed.odds;
+        }
+      }
+      if (!odds) {
+        odds = {
+          side: 1.50,
+          corner: 1.50,
+          foul: 1.50,
+          goal: 1.50,
+          atLeastOne: 1.50
+        };
+      }
+      socket.emit('odds-update', {
+        type: 'odds',
+        odds: odds,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('[WebSocket] Erro ao enviar odds:', error);
+    }
+  });
+
+  // Listener para solicitar limits manualmente
+  socket.on('request-limits', async () => {
+    console.log(`[WebSocket] Cliente ${socket.id} solicitou limits`);
+    try {
+      const limitsValue = await redisClient.get('prj-nextplay:limits:latest');
+      let limits = null;
+      if (limitsValue) {
+        const parsed = JSON.parse(limitsValue);
+        if (parsed.type === 'limits' && parsed.limits) {
+          limits = parsed.limits;
+        }
+      }
+      if (!limits) {
+        limits = {
+          minimumBet: 200,
+          maximumBet: 10000,
+          refund: 95,
+          bettingTime: 10,
+          playTime: 60,
+          waitingTime: 10
+        };
+      }
+      socket.emit('limits-update', {
+        type: 'limits',
+        limits: limits,
+        timestamp: new Date().toISOString()
+      });
+    } catch (error) {
+      console.error('[WebSocket] Erro ao enviar limits:', error);
+    }
+  });
+
   socket.on('disconnect', () => {
-    console.log('Cliente desconectado:', socket.id);
+    console.log(`[WebSocket] Cliente desconectado: ${socket.id} (Total: ${connectedClients - 1})`);
     connectedClients = Math.max(0, connectedClients - 1);
     publishOnlinePlayers();
   });

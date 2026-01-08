@@ -36,9 +36,7 @@ const EVENT_NAMES = {
 };
 
 class EventValidator {
-  constructor(betsService, usersService, io) {
-    this.betsService = betsService;
-    this.usersService = usersService;
+  constructor(io) {
     this.io = io;
     this.subscribers = new Map(); // Map<gameId, RedisClient>
     this.gameEvents = new Map();  // Map<marketId, Array<events>>
@@ -263,23 +261,6 @@ class EventValidator {
   }
 
   /**
-   * Finaliza a coleta de eventos de um mercado
-   * NOTA: Este método apenas encerra a coleta de eventos e os armazena no banco
-   * A lógica de finalização das apostas foi movida para o serviço 'finalizar-apostas'
-   */
-  async finalizeBets(marketId) {
-    console.log(`[EventValidator] Finalizando coleta de eventos do mercado ${marketId}`);
-
-    const events = this.gameEvents.get(marketId) || [];
-    console.log(`[EventValidator] Total de eventos registrados: ${events.length}`);
-
-    // Limpar eventos da memória (já foram armazenados no banco via logs)
-    this.gameEvents.delete(marketId);
-    console.log(`[EventValidator] Coleta de eventos finalizada para mercado ${marketId}`);
-    console.log(`[EventValidator] ⚠️  As apostas serão processadas pelo serviço 'finalizar-apostas'`);
-  }
-
-  /**
    * Para todos os subscribers ativos
    */
   async shutdown() {
@@ -309,6 +290,14 @@ class EventValidator {
    */
   getMarketEvents(marketId) {
     return this.gameEvents.get(marketId) || [];
+  }
+
+  /**
+   * Limpa eventos de um mercado da memória
+   */
+  clearMarketEvents(marketId) {
+    this.gameEvents.delete(marketId);
+    console.log(`[EventValidator] Eventos do mercado ${marketId} limpos da memória`);
   }
 }
 

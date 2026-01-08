@@ -1,5 +1,14 @@
 import { getBetsDb } from './mongodb.js';
 
+
+const eventTypeNames =  {
+  side: "Lateral",
+  corner: "Escanteio",
+  foul: "Falta",
+  goal: "Gol",
+  atLeastOne: "Pelo menos um",
+};
+
 /**
  * Serviço de Apostas
  * Gerencia apostas, logs e mercados
@@ -8,6 +17,45 @@ class BetsService {
   constructor() {
     this.currentMarketId = null;
     this.currentMarket = null;
+  }
+
+  /**
+   * Gera dados da requisição para API externa de apostas
+   */
+  generateBetRequest(betData, betId, transactionId) {
+    const now = new Date().toISOString();
+    return {
+      biabCustomer: betData.biabCustomer,
+      bets: [{
+        accountId: betData.accountId,
+        status: "BETTED",
+        betId: betId,
+        stake: betData.amount,
+        odd: betData.odd,
+        lastUpdated: now,
+        placedDate: now,
+        appLoginId: betData.loginId.toString(),
+        transaction: {
+          transactionId: transactionId,
+          amount: -betData.amount  // Negativo para BETTED
+        },
+        // profit: 0,
+        sportId: betData.sportId,
+        sportName: betData.sportName,
+        competitionId: betData.competitionId,
+        competitionName: betData.competitionName,
+        eventId: betData.eventId, 
+        eventName: betData.eventName,
+        eventDate: betData.eventDate,
+        handicap: null,
+        marketId: this.currentMarketId,
+        marketName: betData.eventType, // FALTA,
+        marketType: "custom",
+        selectionId: betData.eventId, 
+        selectionName: `${eventTypeNames?.[betData?.eventType]} ira acontecer no JOGO ${betData.selectedSide} - ${betData?.eventName}`, // TODO: FALTA IRA ACONTECER NO JOGO FLAMENGO VS CRUZEIRO
+        betRef: "next-move"
+      }]
+    };
   }
 
   /**
@@ -189,11 +237,11 @@ class BetsService {
       const betsCollection = db.collection('bets');
 
       // Calcula o total de payouts das apostas ganhas deste mercado
-      const bets = await betsCollection
-        .find({ marketId: targetMarketId, status: 'won' })
-        .toArray();
+      // const bets = await betsCollection
+      //   .find({ marketId: targetMarketId, status: 'won' })
+      //   .toArray();
 
-      const totalPayout = bets.reduce((sum, bet) => sum + (bet.payout || 0), 0);
+      // const totalPayout = bets.reduce((sum, bet) => sum + (bet.payout || 0), 0);
 
       // Atualiza o mercado com status 'completed' e totalPayout
       await marketsCollection.updateOne(
@@ -201,14 +249,14 @@ class BetsService {
         {
           $set: {
             status: 'completed',
-            totalPayout: totalPayout,
+            // totalPayout: totalPayout,
             completedAt: new Date(),
             updatedAt: new Date()
           }
         }
       );
 
-      console.log(`[BetsService] 🏆 Mercado concluído: ${targetMarketId} (Total pago: R$ ${totalPayout})`);
+      console.log(`[BetsService] 🏆 Mercado concluído: ${targetMarketId}`);
 
       // Limpa o mercado atual se for o mercado atual (prepara para o próximo)
       if (targetMarketId === this.currentMarketId) {
@@ -219,7 +267,6 @@ class BetsService {
       return {
         success: true,
         marketId: targetMarketId,
-        totalPayout
       };
     } catch (error) {
       console.error('[BetsService] Erro ao completar mercado:', error);
@@ -265,7 +312,7 @@ class BetsService {
    * Realiza uma aposta
    */
   async placeBet(betData) {
-    const { userId, gameId, gameName, eventType, amount, selectedSide, odd } = betData;
+    const { userId, gameId, gameName, eventType, accountId, amount, selectedSide, odd, biabCustomer, loginId } = betData;
 
     // Validação: deve haver um mercado aberto
     if (!this.currentMarketId) {
@@ -284,65 +331,178 @@ class BetsService {
       };
     }
 
+    let betId;
+    let transactionId;
+
     try {
+      const { ObjectId } = await import('mongodb');
       const db = await getBetsDb();
       const betsCollection = db.collection('bets');
-      const marketsCollection = db.collection('markets');
-      const { ObjectId } = await import('mongodb');
 
-      // Gera ID único para a aposta
-      const betId = new ObjectId();
+      betId = new ObjectId().toString();
+      transactionId = `txn_${Date.now()}_${betId.slice(-8)}`;
 
-      // Calcula potencial de ganho
-      const potentialWin = Math.floor(amount * odd);
+      const betRequest = this.generateBetRequest(
+        { ...betData, loginId, biabCustomer },
+        betId,
+        transactionId
+      );
 
-      // Cria o documento da aposta
-      const bet = {
-        _id: betId,
-        betId: betId.toString(),
+      const betDoc = {
+        ...betRequest.bets[0],
         userId,
-        gameId,
-        gameName,
         marketId: this.currentMarketId,
-        eventType,
-        selectedSide,
-        amount,
-        odd,
-        potentialWin,
         status: 'pending',
-        payout: null,
-        refund: null,
-        resultReason: null,
-        eventsCount: 0,
         createdAt: new Date(),
         updatedAt: new Date(),
-        processedAt: null
+        processedAt: null,
+        apiResponse: null,
+        errorDetails: null
       };
 
-      // Insere a aposta no banco
-      await betsCollection.insertOne(bet);
+      await betsCollection.insertOne(betDoc);
 
-      // Atualiza contadores do mercado
-      await marketsCollection.updateOne(
-        { marketId: this.currentMarketId },
+      await this.createBetLog({
+        betId: betId,
+        userId,
+        action: 'bet_created',
+        message: 'Aposta criada e salva no banco de dados',
+        marketId: this.currentMarketId,
+        metadata: {
+          amount,
+          odd,
+          eventType,
+          selectedSide
+        }
+      });
+
+      const apiUrl = 'https://ua5pajgphh.execute-api.sa-east-1.amazonaws.com/fulltbet/fast-market';
+      // TODO: JOGAR PARA ENV
+
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(betRequest)
+      });
+
+      const responseData = await response.json();
+
+      if (!response.ok) {
+        // API retornou erro - atualiza aposta para 'failed'
+        const errorType = responseData.type || 'UNKNOWN_ERROR';
+        const errorMessage = responseData.message || response.statusText;
+
+        await betsCollection.updateOne(
+          { betId: betId },
+          {
+            $set: {
+              status: 'failed',
+              errorDetails: {
+                errorType,
+                errorMessage,
+                apiResponse: responseData
+              },
+              updatedAt: new Date()
+            }
+          }
+        );
+
+        await this.createBetLog({
+          betId: betId,
+          userId,
+          action: 'bet_failed',
+          message: `Aposta rejeitada pela API: ${errorMessage}`,
+          marketId: this.currentMarketId,
+          errorMessage: errorType,
+          metadata: {
+            ...betRequest,
+            apiError: errorType,
+            apiMessage: errorMessage,
+            apiResponse: responseData
+          }
+        });
+
+        return {
+          success: false,
+          error: errorMessage,
+          errorType: errorType,
+          betId: betId,
+          details: responseData
+        };
+      }
+
+      // API retornou sucesso - atualiza aposta para 'confirmed'
+      await betsCollection.updateOne(
+        { betId: betId },
         {
-          $inc: {
-            totalBets: 1,
-            totalAmount: amount
-          },
           $set: {
+            status: 'confirmed',
+            apiResponse: responseData,
             updatedAt: new Date()
           }
         }
       );
 
-      // Cria log inicial da aposta
-      await this.createBetLog({
-        betId: bet.betId,
-        userId,
-        action: 'bet_placed',
-        message: 'Aposta realizada com sucesso',
+      // // Log de sucesso
+      // await this.createBetLog({
+      //   betId: betId,
+      //   userId,
+      //   action: 'bet_confirmed',
+      //   message: 'Aposta confirmada pelo gerenciador de banca',
+      //   marketId: this.currentMarketId,
+      //   metadata: {
+      //     ...betRequest,
+      //     apiResponse: responseData
+      //   }
+      // });
+
+      return {
+        success: true,
+        betId: betId,
+        transactionId: transactionId,
         marketId: this.currentMarketId,
+        message: 'Aposta realizada com sucesso',
+        apiResponse: responseData
+      };
+    } catch (error) {
+      console.error('[BetsService] Erro ao processar aposta:', error);
+
+      // Se já temos betId, atualiza o status para 'error' no banco
+      if (betId) {
+        try {
+          const db = await getBetsDb();
+          const betsCollection = db.collection('bets');
+
+          await betsCollection.updateOne(
+            { betId: betId },
+            {
+              $set: {
+                status: 'error',
+                errorDetails: {
+                  errorType: 'NETWORK_ERROR',
+                  errorMessage: error.message
+                },
+                updatedAt: new Date()
+              }
+            }
+          );
+
+          console.log(`[BetsService] ⚠️ Aposta ${betId} marcada como 'error' - Falha de conexão`);
+        } catch (updateError) {
+          console.error('[BetsService] Erro ao atualizar status da aposta:', updateError);
+        }
+      }
+
+      // Log do erro de conexão/network
+      await this.createBetLog({
+        betId: betId || 'unknown',
+        userId,
+        action: 'bet_error',
+        message: 'Erro ao conectar com API externa',
+        marketId: this.currentMarketId,
+        errorMessage: error.message,
         metadata: {
           gameId,
           gameName,
@@ -350,31 +510,15 @@ class BetsService {
           selectedSide,
           amount,
           odd,
-          potentialWin
+          errorStack: error.stack
         }
       });
 
-      console.log(`[BetsService] ✅ Aposta criada:`, {
-        betId: bet.betId,
-        userId,
-        gameId,
-        eventType,
-        amount,
-        odd,
-        potentialWin
-      });
-
-      return {
-        success: true,
-        betId: bet.betId,
-        marketId: this.currentMarketId,
-        bet
-      };
-    } catch (error) {
-      console.error('[BetsService] Erro ao criar aposta:', error);
       return {
         success: false,
-        error: error.message
+        error: 'Erro ao processar aposta. Tente novamente.',
+        betId: betId,
+        details: error.message
       };
     }
   }
@@ -438,13 +582,13 @@ class BetsService {
   /**
    * Busca apostas de um usuário
    */
-  async getBetsByUser(userId, limit = 50) {
+  async getBetsByUser(accountId, limit = 50) {
     try {
       const db = await getBetsDb();
       const betsCollection = db.collection('bets');
 
       const bets = await betsCollection
-        .find({ userId })
+        .find({ accountId })
         .sort({ createdAt: -1 })
         .limit(limit)
         .toArray();

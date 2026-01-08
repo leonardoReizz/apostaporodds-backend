@@ -284,30 +284,29 @@ class MarketManager {
     // Para escuta de eventos
     await this.stopEventListeners();
 
-    // Finaliza o jogo no BetsService
-    if (this.betsService) {
+    // Finaliza o jogo no BetsService e salva os results dos eventos
+    if (this.betsService && this.eventValidator && this.currentMarketId) {
+      // Finaliza jogo (muda status para 'processing')
       const result = await this.betsService.endGame();
       if (result.success) {
         console.log(`[MarketManager] ✅ Jogo finalizado no mercado: ${result.marketId}`);
       } else {
         console.error('[MarketManager] ❌ Erro ao finalizar jogo:', result.error);
       }
-    }
 
-    // Processa resultados das apostas com base nos eventos
-    if (this.eventValidator && this.currentMarketId) {
-      console.log(`[MarketManager] 🎯 Finalizando apostas do mercado ${this.currentMarketId}`);
-      await this.eventValidator.finalizeBets(this.currentMarketId);
-    }
+      // Salva os results dos eventos coletados
+      console.log(`[MarketManager] 💾 Salvando results do mercado ${this.currentMarketId}`);
+      const activeGames = this.getActiveGames();
+      const events = this.eventValidator.getMarketEvents(this.currentMarketId);
 
-    // Completa o mercado após todas as apostas serem processadas
-    if (this.betsService && this.currentMarketId) {
-      const completeResult = await this.betsService.completeMarket(this.currentMarketId);
-      if (completeResult.success) {
-        console.log(`[MarketManager] ✅ Mercado concluído: ${completeResult.marketId}`);
-      } else {
-        console.error(`[MarketManager] ❌ Erro ao concluir mercado:`, completeResult.error);
-      }
+      // Agrupar eventos por side e tipo
+      const results = this.buildMarketResults(events, activeGames);
+
+      await this.betsService.processMarket(results);
+      console.log(`[MarketManager] ✅ Results salvos no mercado`);
+
+      // Limpa eventos da memória após salvar
+      this.eventValidator.clearMarketEvents(this.currentMarketId);
     }
 
     // Aguarda um momento antes de ir para o intervalo
@@ -366,6 +365,86 @@ class MarketManager {
       clearInterval(this.intervalTimer);
       this.intervalTimer = null;
     }
+  }
+
+  /**
+   * Constrói a estrutura de results a partir dos eventos coletados
+   */
+  buildMarketResults(events, activeGames) {
+    const results = {
+      totalEvents: events.length,
+      eventsBySide: {
+        A: {
+          gameId: null,
+          gameName: null,
+          events: []
+        },
+        B: {
+          gameId: null,
+          gameName: null,
+          events: []
+        }
+      },
+      summary: {
+        side: { A: 0, B: 0 },
+        corner: { A: 0, B: 0 },
+        foul: { A: 0, B: 0 },
+        goal: { A: 0, B: 0 }
+      }
+    };
+
+    // Encontrar games A e B dos active games
+    const gameA = activeGames ? activeGames.find(g => g.side === 'A') : null;
+    const gameB = activeGames ? activeGames.find(g => g.side === 'B') : null;
+
+    if (gameA) {
+      results.eventsBySide.A.gameId = gameA.id;
+      results.eventsBySide.A.gameName = `${gameA.home.name} vs ${gameA.away.name}`;
+    }
+
+    if (gameB) {
+      results.eventsBySide.B.gameId = gameB.id;
+      results.eventsBySide.B.gameName = `${gameB.home.name} vs ${gameB.away.name}`;
+    }
+
+    // Processar cada evento e agrupar por side
+    for (const event of events) {
+      if (!event.mappedType) continue; // Ignora eventos não mapeados
+
+      // Determinar qual side este evento pertence
+      let side = null;
+      if (gameA && event.gameId === gameA.id) {
+        side = 'A';
+      } else if (gameB && event.gameId === gameB.id) {
+        side = 'B';
+      }
+
+      if (!side) continue; // Ignora eventos de jogos não encontrados
+
+      // Adicionar evento ao side correspondente
+      results.eventsBySide[side].events.push({
+        type: event.mappedType,
+        originalType: event.originalType,
+        eventName: event.eventName,
+        timestamp: event.timestamp,
+        matchTime: event.matchTime,
+        competitor: event.competitor
+      });
+
+      // Incrementar contador no summary
+      if (results.summary[event.mappedType]) {
+        results.summary[event.mappedType][side]++;
+      }
+    }
+
+    console.log(`[MarketManager] Results compilados:`, {
+      totalEvents: results.totalEvents,
+      sideA: results.eventsBySide.A.events.length,
+      sideB: results.eventsBySide.B.events.length,
+      summary: results.summary
+    });
+
+    return results;
   }
 
   /**
