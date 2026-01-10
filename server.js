@@ -6,9 +6,7 @@ import { betsService } from './bets-service.js';
 import env from './env/index.js';
 import EventValidator from './event-validator.js';
 import MarketManager from './market-manager.js';
-import { usersService } from './users-service.js';
 import cors from "cors"
-import { success } from 'zod';
 import { decodeJwt } from "./utils/decoded-jwt.js"
 
 const app = express();
@@ -640,6 +638,77 @@ app.get('/api/bets/user/:accountId', async (req, res) => {
   }
 });
 
+// Rota para buscar estatísticas de um usuário
+app.get('/api/users/:accountId', async (req, res) => {
+  const { accountId } = req.params;
+
+  try {
+    const { getBetsDb } = await import('./mongodb.js');
+    const db = await getBetsDb();
+    const betsCollection = db.collection('bets');
+
+    // Busca todas as apostas do usuário
+    const userBets = await betsCollection
+      .find({ accountId })
+      .toArray();
+
+    // Calcula estatísticas
+    const totalBets = userBets.length;
+
+    let totalWon = 0;   // Total ganho (lucro líquido)
+    let totalLost = 0;  // Total perdido
+
+    userBets.forEach(bet => {
+      // O valor apostado é o valor absoluto de transaction.amount (que é negativo)
+      const stakeAmount = Math.abs(bet.transaction?.amount || 0);
+
+      // Verifica o status da aposta
+      if (bet.status === 'BETTED' && bet.profit && bet.profit > 0) {
+        // Aposta GANHA: profit já vem calculado da API (stake * odd - stake)
+        // Ex: apostou R$ 1, odd 2.0 -> profit = 2 - 1 = R$ 1 de lucro
+        totalWon += bet.profit;
+      }
+      else if (bet.status === 'void' && bet.refund !== undefined) {
+        // Aposta ANULADA com reembolso parcial
+        // Ex: apostou R$ 1, refund = 0.9 -> devolveu R$ 0.90, perdeu R$ 0.10
+        const refundedAmount = bet.refund;
+        const lossAmount = stakeAmount - refundedAmount;
+        totalLost += lossAmount;
+      }
+      else if (bet.status === 'BETTED' && (!bet.profit || bet.profit <= 0)) {
+        // Aposta PERDIDA: perde todo o valor apostado
+        totalLost += stakeAmount;
+      }
+      else if (bet.status === 'void' && !bet.refund) {
+        // Aposta ANULADA sem reembolso: perde todo o valor
+        totalLost += stakeAmount;
+      }
+      // Status 'pending', 'confirmed', 'failed', 'error' não entram no cálculo
+    });
+
+    // Calcula lucro/prejuízo total
+    const profit = totalWon - totalLost;
+
+    // Retorna as estatísticas em centavos (multiplicar por 100 para converter reais -> centavos)
+    res.json({
+      success: true,
+      user: {
+        accountId,
+        totalBets,
+        totalWon: Math.round(totalWon * 100),      // Converte para centavos
+        totalLost: Math.round(totalLost * 100),    // Converte para centavos
+        profit: Math.round(profit * 100)           // Converte para centavos
+      }
+    });
+  } catch (error) {
+    console.error('[API] Erro ao buscar estatísticas do usuário:', error);
+    res.status(500).json({
+      error: 'Erro ao buscar estatísticas do usuário',
+      message: error.message
+    });
+  }
+});
+
 // Rota para buscar apostas de um mercado específico
 app.get('/api/bets/market/:marketId', async (req, res) => {
   const { marketId } = req.params;
@@ -808,123 +877,6 @@ app.get('/api/markets/:marketId/events', async (req, res) => {
     });
   }
 });
-
-// ==================== ENDPOINTS DE USUÁRIOS ====================
-
-// Rota para buscar informações de um usuário
-app.get('/api/users/:userId', async (req, res) => {
-  const { userId } = req.params;
-
-  try {
-    const result = await usersService.getUser(userId);
-
-    if (!result.success) {
-      return res.status(500).json({
-        error: result.error || 'Erro ao buscar usuário'
-      });
-    }
-
-    res.json({
-      success: true,
-      user: result.user
-    });
-  } catch (error) {
-    console.error('[API] Erro ao buscar usuário:', error);
-    res.status(500).json({
-      error: 'Erro ao buscar usuário'
-    });
-  }
-});
-
-// Rota para adicionar saldo manualmente (admin)
-// app.post('/api/users/:userId/add-balance', async (req, res) => {
-//   const { userId } = req.params;
-//   const { amount, reason } = req.body;
-
-//   if (!amount || amount <= 0) {
-//     return res.status(400).json({
-//       error: 'Valor deve ser maior que zero'
-//     });
-//   }
-
-//   try {
-//     const result = await usersService.addBalanceManual(userId, amount, reason);
-
-//     if (!result.success) {
-//       return res.status(500).json({
-//         error: result.error || 'Erro ao adicionar saldo'
-//       });
-//     }
-
-//     res.json({
-//       success: true,
-//       message: result.message,
-//       user: result.user,
-//       newBalance: result.newBalance
-//     });
-//   } catch (error) {
-//     console.error('[API] Erro ao adicionar saldo:', error);
-//     res.status(500).json({
-//       error: 'Erro ao adicionar saldo'
-//     });
-//   }
-// });
-
-// Rota para resetar saldo de um usuário
-// app.post('/api/users/:userId/reset-balance', async (req, res) => {
-//   const { userId } = req.params;
-//   const { newBalance } = req.body;
-
-//   const balanceToSet = newBalance !== undefined ? newBalance : 1000;
-
-//   try {
-//     const result = await usersService.resetBalance(userId, balanceToSet);
-
-//     if (!result.success) {
-//       return res.status(404).json({
-//         error: result.error || 'Usuário não encontrado'
-//       });
-//     }
-
-//     res.json({
-//       success: true,
-//       message: `Saldo resetado para R$ ${balanceToSet}`,
-//       user: result.user,
-//       newBalance: result.newBalance
-//     });
-//   } catch (error) {
-//     console.error('[API] Erro ao resetar saldo:', error);
-//     res.status(500).json({
-//       error: 'Erro ao resetar saldo'
-//     });
-//   }
-// });
-
-// Rota para listar todos os usuários
-// app.get('/api/users', async (req, res) => {
-//   const limit = parseInt(req.query.limit) || 100;
-
-//   try {
-//     const result = await usersService.getAllUsers(limit);
-
-//     if (!result.success) {
-//       return res.status(500).json({
-//         error: result.error || 'Erro ao listar usuários'
-//       });
-//     }
-
-//     res.json({
-//       success: true,
-//       users: result.users,
-//       count: result.count
-//     });
-//   } catch (error) {
-//     console.error('[API] Erro ao listar usuários:', error);
-//     res.status(500).json({
-//       error: 'Erro ao listar usuários'
-//     });
-//   }
-// });
 
 io.on('connection', async (socket) => {
   console.log(`[WebSocket] Cliente conectado: ${socket.id} (Total: ${connectedClients + 1})`);
